@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,11 +14,18 @@ public partial class Form1 : Form
         TextAlign = ContentAlignment.MiddleLeft
     };
     private readonly ToolStripStatusLabel _hintsStatus = new();
+    private readonly ToolStripMenuItem _previewMenuItem = new("&Markdown Preview")
+    {
+        CheckOnClick = true,
+        ShortcutKeys = Keys.Control | Keys.Shift | Keys.M
+    };
     private readonly System.Windows.Forms.Timer _highlightTimer = new() { Interval = 180 };
     private readonly Dictionary<RichTextBox, DocumentState> _documents = new();
     private readonly HashSet<RichTextBox> _pendingHighlightEditors = new();
+    private readonly HashSet<RichTextBox> _pendingPreviewEditors = new();
     private int _untitledCounter;
     private bool _formatting;
+    private bool _updatingPreviewMenu;
 
     public Form1()
     {
@@ -37,14 +45,24 @@ public partial class Form1 : Form
         _highlightTimer.Tick += (_, _) =>
         {
             _highlightTimer.Stop();
+
             var pendingEditors = _pendingHighlightEditors.ToArray();
             _pendingHighlightEditors.Clear();
-
             foreach (var editor in pendingEditors)
             {
                 if (_documents.TryGetValue(editor, out var document) && document.IsMarkdown)
                 {
                     ApplyMarkdownHints(editor);
+                }
+            }
+
+            var pendingPreviews = _pendingPreviewEditors.ToArray();
+            _pendingPreviewEditors.Clear();
+            foreach (var editor in pendingPreviews)
+            {
+                if (_documents.TryGetValue(editor, out var document) && document.PreviewVisible)
+                {
+                    RenderMarkdownPreview(editor);
                 }
             }
         };
@@ -67,12 +85,18 @@ public partial class Form1 : Form
         fileMenu.DropDownItems.Add(CreateMenuItem("E&xit", Keys.Alt | Keys.F4, (_, _) => Close()));
         menuStrip.Items.Add(fileMenu);
 
+        var viewMenu = new ToolStripMenuItem("&View");
+        _previewMenuItem.CheckedChanged += HandlePreviewMenuCheckedChanged;
+        viewMenu.DropDownItems.Add(_previewMenuItem);
+        menuStrip.Items.Add(viewMenu);
+
         _tabs.Dock = DockStyle.Fill;
         _tabs.Multiline = true;
         _tabs.SelectedIndexChanged += (_, _) =>
         {
             UpdateStatusBar();
             UpdateWindowTitle();
+            UpdatePreviewMenu();
         };
 
         var statusBar = new StatusStrip();
@@ -111,25 +135,63 @@ public partial class Form1 : Form
             WordWrap = false
         };
 
+        var preview = new WebBrowser
+        {
+            AllowWebBrowserDrop = false,
+            Dock = DockStyle.Fill,
+            IsWebBrowserContextMenuEnabled = false,
+            ScriptErrorsSuppressed = true,
+            WebBrowserShortcutsEnabled = false
+        };
+        preview.Navigating += HandlePreviewNavigating;
+
+        var split = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            FixedPanel = FixedPanel.None,
+            Orientation = Orientation.Vertical,
+            Size = new Size(900, 540),
+            SplitterDistance = 450,
+            Panel1MinSize = 180,
+            Panel2MinSize = 180
+        };
+
+        split.Panel1.Controls.Add(editor);
+        split.Panel2.Controls.Add(preview);
+
         var displayName = filePath is null ? $"Untitled {++_untitledCounter}" : Path.GetFileName(filePath);
-        _documents.Add(editor, new DocumentState(filePath, displayName, filePath is null || IsMarkdownFile(filePath)));
+        var isMarkdown = filePath is null || IsMarkdownFile(filePath);
+        var document = new DocumentState(filePath, displayName, isMarkdown, split, preview)
+        {
+            PreviewVisible = isMarkdown
+        };
+        _documents.Add(editor, document);
 
         var page = new TabPage(displayName);
-        page.Controls.Add(editor);
+        page.Controls.Add(split);
         _tabs.TabPages.Add(page);
         _tabs.SelectedTab = page;
+        split.Panel2Collapsed = !document.PreviewVisible;
 
         editor.Text = contents ?? string.Empty;
         editor.TextChanged += HandleEditorTextChanged;
         editor.SelectionChanged += HandleEditorSelectionChanged;
+
         ApplyMarkdownHints(editor);
+        if (document.PreviewVisible)
+        {
+            RenderMarkdownPreview(editor);
+        }
+
         UpdateTabCaption(editor);
         UpdateWindowTitle();
+        UpdatePreviewMenu();
     }
 
     private RichTextBox? GetActiveEditor()
     {
-        return _tabs.SelectedTab?.Controls.OfType<RichTextBox>().FirstOrDefault();
+        return _tabs.SelectedTab?.Controls.OfType<SplitContainer>().FirstOrDefault()?.Panel1.Controls
+            .OfType<RichTextBox>().FirstOrDefault();
     }
 
     private void HandleEditorTextChanged(object? sender, EventArgs e)
@@ -147,6 +209,15 @@ public partial class Form1 : Form
         if (document.IsMarkdown)
         {
             _pendingHighlightEditors.Add(editor);
+        }
+
+        if (document.PreviewVisible)
+        {
+            _pendingPreviewEditors.Add(editor);
+        }
+
+        if (_pendingHighlightEditors.Count > 0 || _pendingPreviewEditors.Count > 0)
+        {
             _highlightTimer.Stop();
             _highlightTimer.Start();
         }
@@ -226,6 +297,81 @@ public partial class Form1 : Form
         }
     }
 
+    private void RenderMarkdownPreview(RichTextBox editor)
+    {
+        if (_documents.TryGetValue(editor, out var document)
+            && document.PreviewVisible
+            && !document.Preview.IsDisposed)
+        {
+            document.Preview.DocumentText = MarkdownRenderer.ToHtmlDocument(editor.Text);
+        }
+    }
+
+    private void HandlePreviewNavigating(object? sender, WebBrowserNavigatingEventArgs e)
+    {
+        if (e.Url is null || e.Url.Scheme.Equals("about", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        e.Cancel = true;
+        if (e.Url.Scheme is not ("http" or "https" or "mailto"))
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(e.Url.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch
+        {
+            // Keep link launch errors from taking down the editor.
+        }
+    }
+
+    private void HandlePreviewMenuCheckedChanged(object? sender, EventArgs e)
+    {
+        if (!_updatingPreviewMenu && GetActiveEditor() is { } editor)
+        {
+            SetPreviewVisible(editor, _previewMenuItem.Checked);
+        }
+    }
+
+    private void SetPreviewVisible(RichTextBox editor, bool visible)
+    {
+        if (!_documents.TryGetValue(editor, out var document))
+        {
+            return;
+        }
+
+        document.PreviewVisible = visible;
+        document.Split.Panel2Collapsed = !visible;
+        if (visible)
+        {
+            RenderMarkdownPreview(editor);
+        }
+
+        UpdatePreviewMenu();
+    }
+
+    private void UpdatePreviewMenu()
+    {
+        var editor = GetActiveEditor();
+        _updatingPreviewMenu = true;
+        try
+        {
+            _previewMenuItem.Enabled = editor is not null;
+            _previewMenuItem.Checked = editor is not null
+                && _documents.TryGetValue(editor, out var document)
+                && document.PreviewVisible;
+        }
+        finally
+        {
+            _updatingPreviewMenu = false;
+        }
+    }
+
     private void OpenFiles(object? sender, EventArgs e)
     {
         using var dialog = new OpenFileDialog
@@ -247,7 +393,7 @@ public partial class Form1 : Form
 
             if (existingEditor is not null)
             {
-                _tabs.SelectedTab = existingEditor.Parent as TabPage;
+                _tabs.SelectedTab = existingEditor.Parent?.Parent?.Parent as TabPage;
                 continue;
             }
 
@@ -310,8 +456,16 @@ public partial class Form1 : Form
             document.FilePath = filePath;
             document.DisplayName = Path.GetFileName(filePath);
             document.IsDirty = false;
+            var wasMarkdown = document.IsMarkdown;
             document.IsMarkdown = IsMarkdownFile(filePath);
+            if (!wasMarkdown && document.IsMarkdown)
+            {
+                document.PreviewVisible = true;
+                document.Split.Panel2Collapsed = false;
+            }
+
             ApplyMarkdownHints(editor);
+            RenderMarkdownPreview(editor);
             UpdateTabCaption(editor);
             UpdateWindowTitle();
             UpdateStatusBar();
@@ -336,8 +490,9 @@ public partial class Form1 : Form
         }
 
         _pendingHighlightEditors.Remove(editor);
+        _pendingPreviewEditors.Remove(editor);
         _documents.Remove(editor);
-        if (_pendingHighlightEditors.Count == 0)
+        if (_pendingHighlightEditors.Count == 0 && _pendingPreviewEditors.Count == 0)
         {
             _highlightTimer.Stop();
         }
@@ -352,6 +507,7 @@ public partial class Form1 : Form
         {
             UpdateStatusBar();
             UpdateWindowTitle();
+            UpdatePreviewMenu();
         }
     }
 
@@ -395,7 +551,7 @@ public partial class Form1 : Form
 
     private void UpdateTabCaption(RichTextBox editor)
     {
-        if (!_documents.TryGetValue(editor, out var document) || editor.Parent is not TabPage page)
+        if (!_documents.TryGetValue(editor, out var document) || editor.Parent?.Parent?.Parent is not TabPage page)
         {
             return;
         }
@@ -443,7 +599,6 @@ public partial class Form1 : Form
         return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
     }
 
-
     protected override void Dispose(bool disposing)
     {
         if (disposing)
@@ -454,11 +609,19 @@ public partial class Form1 : Form
         base.Dispose(disposing);
     }
 
-    private sealed class DocumentState(string? filePath, string displayName, bool isMarkdown)
+    private sealed class DocumentState(
+        string? filePath,
+        string displayName,
+        bool isMarkdown,
+        SplitContainer split,
+        WebBrowser preview)
     {
         public string? FilePath { get; set; } = filePath;
         public string DisplayName { get; set; } = displayName;
         public bool IsMarkdown { get; set; } = isMarkdown;
         public bool IsDirty { get; set; }
+        public bool PreviewVisible { get; set; }
+        public SplitContainer Split { get; } = split;
+        public WebBrowser Preview { get; } = preview;
     }
 }
